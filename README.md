@@ -115,8 +115,10 @@ This application consists of two main components:
 ### Data Storage
 
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
-- The database maintains tables for chats and messages
+- The database maintains tables for chats and messages with automatic schema migration
 - Messages are indexed for efficient searching and retrieval
+- Enhanced chat metadata includes group type detection and compatibility information
+- Unread message tracking with automatic status management
 
 ## Usage
 
@@ -128,7 +130,7 @@ Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
 - **list_messages**: Retrieve messages with optional filters and context
-- **list_chats**: List available chats with metadata
+- **list_chats**: List available chats with metadata, including group type and compatibility information
 - **get_chat**: Get information about a specific chat
 - **get_direct_chat_by_contact**: Find a direct chat with a specific contact
 - **get_contact_chats**: List all chats involving a specific contact
@@ -138,6 +140,40 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **get_unread_messages**: Get an overview of recent chats with unread messages
+- **check_group_compatibility**: Analyze WhatsApp JID compatibility for messaging operations
+
+### WhatsApp Communities Support
+
+The MCP server now includes enhanced support for different WhatsApp chat types:
+
+#### Chat Type Detection
+
+The system automatically detects and categorizes chat types:
+
+- **Personal Chats**: Direct messages with individual contacts (e.g., `123456789@s.whatsapp.net`)
+- **Traditional Groups**: Regular WhatsApp groups (e.g., `120363128292695548@g.us`)
+- **WhatsApp Communities**: Community channels with limited support (e.g., `120363128292695548-1234567890@g.us`)
+
+#### Compatibility Checking
+
+- **check_group_compatibility** tool analyzes JID format and returns compatibility information
+- Proactive compatibility checks prevent messaging errors before they occur
+- Enhanced error messages provide clear guidance when chat types are incompatible
+
+#### Enhanced Chat Listings
+
+All chat listing tools now include:
+- `group_type`: Identifies the chat type (personal, group, community, unknown)
+- `compatible`: Boolean indicating if messaging operations are supported
+- Improved metadata for better chat management
+
+#### WhatsApp Communities Limitations
+
+WhatsApp Communities have limited API support due to platform restrictions:
+- Messaging to Communities may not work reliably
+- Community detection helps avoid compatibility issues
+- Traditional groups are recommended for reliable messaging
 
 ### Media Handling Features
 
@@ -156,6 +192,29 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+## Recent Updates
+
+### Version 2.1 (December 2024)
+
+#### New Features Added:
+- **WhatsApp Communities Compatibility Detection**: Enhanced support for detecting and handling different WhatsApp chat types
+- **Group Compatibility Checking**: New MCP tool to analyze JID compatibility before messaging operations
+- **Enhanced Chat Metadata**: All chat listings now include group type and compatibility information
+- **Improved Error Handling**: Better error messages and proactive compatibility checks
+- **Database Schema Migration**: Automatic database updates for new features
+- **Unread Message Tracking**: Enhanced support for tracking and managing unread messages
+
+#### Bug Fixes:
+- Fixed `list_chats` SQL error when `include_last_message=False`
+- Improved database column handling and migration logic
+- Enhanced error handling for incompatible chat types
+
+#### Technical Improvements:
+- Updated whatsmeow library for better WhatsApp API compatibility
+- Enhanced database schema with automatic migration support
+- Improved REST API endpoints for better integration
+- Better handling of WhatsApp Communities limitations
 
 ## Technical Details
 
@@ -177,5 +236,15 @@ By default, just the metadata of the media is stored in the local database. The 
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+
+### Database Issues
+
+- **Column Missing Errors**: If you see "table has no column named" errors, the database schema needs to be updated. Stop the Go bridge and restart it - it will automatically migrate the database schema.
+- **Port Already in Use**: If you get "bind: Only one usage of each socket address" error, another instance is already running. Use `netstat -ano | findstr :8080` to find the process ID and kill it with `taskkill /PID <pid> /F`.
+
+### WhatsApp Communities Issues
+
+- **Community Messaging Fails**: WhatsApp Communities have limited API support. Use the `check_group_compatibility` tool to verify if a chat supports messaging operations.
+- **Group Type Detection**: If group types are not being detected correctly, ensure you're using the latest version with the enhanced compatibility features.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
