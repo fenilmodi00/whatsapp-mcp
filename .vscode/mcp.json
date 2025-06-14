@@ -1,0 +1,14 @@
+{
+    "servers": {
+        "whatsapp-mcp": {
+            "type": "stdio",
+            "command": "C:\\Users\\nasri\\.local\\bin\\uv.exe",
+            "args": [
+                "--directory",
+                "d:\\whatsapp-mcp\\whatsapp-mcp-server",
+                "run",
+                "main.py"
+            ]
+        }
+    }
+}

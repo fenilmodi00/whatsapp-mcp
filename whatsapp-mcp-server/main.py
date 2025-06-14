@@ -12,11 +12,12 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_unread_messages as whatsapp_get_unread_messages
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP("whatsapp",log_level="ERROR")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -244,6 +245,66 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         return {
             "success": False,
             "message": "Failed to download media"
+        }
+
+@mcp.tool()
+def get_unread_messages(limit: int = 10) -> List[Dict[str, Any]]:
+    """Get an overview of recent chats with unread messages.
+    
+    Args:
+        limit: Maximum number of chats with unread messages to return (default 10)
+    
+    Returns:
+        A list of chat objects with unread message information
+    """
+    unread_chats = whatsapp_get_unread_messages(limit)
+    return unread_chats
+
+@mcp.tool()
+def check_group_compatibility(jid: str) -> Dict[str, Any]:
+    """Check if a WhatsApp JID is compatible with messaging operations.
+    
+    This tool analyzes a WhatsApp JID to determine its type (personal chat, traditional group, 
+    or WhatsApp Community) and whether it's compatible with current messaging capabilities.
+    WhatsApp Communities have limited support due to API restrictions.
+    
+    Args:
+        jid: The WhatsApp JID to analyze (e.g., "123456789@s.whatsapp.net" or "group-id@g.us")
+    
+    Returns:
+        A dictionary containing compatibility information:
+        - jid: The analyzed JID
+        - is_valid: Whether the JID format is valid
+        - group_type: Type of chat (personal, group, community, unknown)
+        - compatible: Whether the JID is compatible with messaging
+        - error: Error message if any issues are found
+    """
+    import requests
+    import json
+    
+    try:
+        # Make request to Go bridge to check compatibility
+        response = requests.post('http://localhost:8080/check-compatibility', 
+                               json={'jid': jid},
+                               timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {
+                "jid": jid,
+                "is_valid": False,
+                "group_type": "unknown",
+                "compatible": False,
+                "error": f"Failed to check compatibility: HTTP {response.status_code}"
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "jid": jid,
+            "is_valid": False,
+            "group_type": "unknown", 
+            "compatible": False,
+            "error": f"Connection error: {str(e)}"
         }
 
 if __name__ == "__main__":

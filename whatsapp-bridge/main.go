@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -20,8 +21,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
-	"bytes"
-
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -39,11 +38,19 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+	IsRead    bool
 }
 
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+}
+
+// Chat represents a chat with basic information
+type Chat struct {
+	JID             string
+	LastMessageTime time.Time
+	UnreadCount     uint32
 }
 
 // Initialize message store
@@ -64,7 +71,8 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			unread_count INTEGER DEFAULT 0
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -81,6 +89,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			is_read BOOLEAN DEFAULT FALSE,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -88,6 +97,33 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Migrate existing tables to add missing columns if they don't exist
+	_, err = db.Exec("ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		// Column might already exist, that's okay
+		fmt.Printf("Note: Could not add unread_count column to chats table (may already exist): %v\n", err)
+	}
+
+	_, err = db.Exec("ALTER TABLE messages ADD COLUMN is_read BOOLEAN DEFAULT FALSE")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		// Column might already exist, that's okay
+		fmt.Printf("Note: Could not add is_read column to messages table (may already exist): %v\n", err)
+	}
+
+	// Add missing columns to existing tables (database migration)
+	migrationQueries := []string{
+		"ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0",
+		"ALTER TABLE messages ADD COLUMN is_read BOOLEAN DEFAULT FALSE",
+	}
+
+	for _, query := range migrationQueries {
+		_, err = db.Exec(query)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			// Ignore "duplicate column" errors (column already exists)
+			fmt.Printf("Migration warning: %v\n", err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -99,11 +135,13 @@ func (store *MessageStore) Close() error {
 }
 
 // Store a chat in the database
-func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time, unreadCount uint32) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, unread_count) VALUES (?, ?, ?, ?)",
+		jid, name, lastMessageTime, unreadCount,
 	)
+	// Log the unread count update
+	fmt.Printf("StoreChat: Updating chat %s with unread count: %d\n", jid, unreadCount)
 	return err
 }
 
@@ -117,9 +155,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, is_read) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, false,
 	)
 	return err
 }
@@ -127,7 +165,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename, is_read FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -139,7 +177,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &msg.IsRead)
 		if err != nil {
 			return nil, err
 		}
@@ -151,22 +189,21 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 }
 
 // Get all chats
-func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+func (store *MessageStore) GetChats() ([]Chat, error) {
+	rows, err := store.db.Query("SELECT jid, last_message_time, unread_count FROM chats ORDER BY last_message_time DESC")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	chats := make(map[string]time.Time)
+	var chats []Chat
 	for rows.Next() {
-		var jid string
-		var lastMessageTime time.Time
-		err := rows.Scan(&jid, &lastMessageTime)
+		var chat Chat
+		err := rows.Scan(&chat.JID, &chat.LastMessageTime, &chat.UnreadCount)
 		if err != nil {
 			return nil, err
 		}
-		chats[jid] = lastMessageTime
+		chats = append(chats, chat)
 	}
 
 	return chats, nil
@@ -183,6 +220,30 @@ func extractTextContent(msg *waProto.Message) string {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
+	}
+
+	var result string
+
+	// Buttons messages
+	if buttons := msg.GetButtonsMessage(); buttons != nil {
+		result += buttons.GetContentText()
+		result += "\n\nButtons:"
+		for _, btn := range buttons.GetButtons() {
+			result += "\n- " + btn.GetButtonText().GetDisplayText()
+		}
+		return result
+	}
+
+	// List messages
+	if list := msg.GetListMessage(); list != nil {
+		result += list.GetDescription()
+		result += "\n\nList:"
+		for _, section := range list.GetSections() {
+			for _, row := range section.GetRows() {
+				result += "\n- " + row.GetTitle() + " — " + row.GetDescription()
+			}
+		}
+		return result
 	}
 
 	// For now, we're ignoring non-text messages
@@ -220,6 +281,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
+		}
+
+		// Check group compatibility for parsed JIDs
+		compatibility := checkGroupCompatibility(recipient)
+		if !compatibility["compatible"].(bool) {
+			if errorMsg, ok := compatibility["error"].(string); ok && errorMsg != "" {
+				return false, fmt.Sprintf("Group compatibility check failed: %s", errorMsg)
+			}
+			return false, "Recipient is not compatible with current messaging capabilities"
 		}
 	} else {
 		// Create JID from phone number
@@ -417,8 +487,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
+	// Determine unread count
+	var unreadCount uint32 = 0
+	if !msg.Info.IsFromMe {
+		// If message is not from me, increment unread count
+		currUnread, err := messageStore.GetUnreadCount(chatJID)
+		if err == nil {
+			unreadCount = currUnread + 1
+		} else {
+			unreadCount = 1
+		}
+	}
+
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp, unreadCount)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -641,7 +723,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +856,108 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting chats
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get all chats from the message store
+		chats, err := messageStore.GetChats()
+		if err != nil {
+			http.Error(w, "Failed to retrieve chats", http.StatusInternalServerError)
+			return
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Send response
+		json.NewEncoder(w).Encode(GetChatsResponse{
+			Success: true,
+			Chats:   chats,
+		})
+	})
+
+	// Handler for marking chat as read/unread
+	http.HandleFunc("/api/mark_chat_read", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req MarkChatReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.ChatJID == "" {
+			http.Error(w, "Chat JID is required", http.StatusBadRequest)
+			return
+		}
+
+		// Mark chat as read or unread
+		var err error
+		if req.Read {
+			err = messageStore.MarkChatAsRead(req.ChatJID)
+		} else {
+			err = messageStore.MarkChatAsUnread(req.ChatJID)
+		}
+
+		if err != nil {
+			http.Error(w, "Failed to update chat read status", http.StatusInternalServerError)
+			return
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Send response
+		json.NewEncoder(w).Encode(MarkChatReadResponse{
+			Success: true,
+			Message: "Chat read status updated",
+		})
+	})
+
+	// Handler for checking group compatibility
+	http.HandleFunc("/check-compatibility", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.JID == "" {
+			http.Error(w, "JID is required", http.StatusBadRequest)
+			return
+		}
+
+		// Check group compatibility
+		compatibility := checkGroupCompatibility(req.JID)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Send response
+		json.NewEncoder(w).Encode(compatibility)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +984,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -845,11 +1029,20 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.MarkChatAsRead:
+			// Handle chat read status changes from other devices
+			fmt.Printf("MarkChatAsRead: %v\n", v)
+			handleMarkChatAsRead(messageStore, v, logger)
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+		case *events.Receipt:
+			// Handle receipt events (when someone reads a message we sent)
+			fmt.Printf("Received receipt: %v\n", v)
+			handleReceipt(messageStore, v, logger)
 		}
 	})
 
@@ -988,7 +1181,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1015,6 +1208,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		if conversation.ID == nil {
 			continue
 		}
+
+		if conversation.UnreadCount == nil {
+			continue
+		}
+
+		// var unreadCount uint32 = 0
+		// if conversation.UnreadCount != nil {
+		// 	unreadCount = *conversation.UnreadCount
+		// 	// if unreadCount == 0 {
+		// 	// 	continue
+		// 	// }
+		// }
 
 		chatJID := *conversation.ID
 
@@ -1045,7 +1250,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			// Extract unread count if available
+			var unreadCount uint32 = 0
+			if conversation.UnreadCount != nil {
+				unreadCount = *conversation.UnreadCount
+				logger.Infof("Chat %s has %d unread messages", chatJID, unreadCount)
+			}
+
+			messageStore.StoreChat(chatJID, name, timestamp, unreadCount)
 
 			// Store messages
 			for _, msg := range messages {
@@ -1345,4 +1557,228 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// Get unread count for a chat
+func (store *MessageStore) GetUnreadCount(chatJID string) (uint32, error) {
+	var unreadCount uint32
+	err := store.db.QueryRow("SELECT unread_count FROM chats WHERE jid = ?", chatJID).Scan(&unreadCount)
+	if err != nil {
+		return 0, err
+	}
+	return unreadCount, nil
+}
+
+// Mark chat as read
+func (store *MessageStore) MarkChatAsRead(chatJID string) error {
+	_, err := store.db.Exec("UPDATE chats SET unread_count = 0 WHERE jid = ?", chatJID)
+	fmt.Printf("MarkChatAsRead: Marking chat %s as read\n", chatJID)
+	return err
+}
+
+// Mark chat as unread
+func (store *MessageStore) MarkChatAsUnread(chatJID string) error {
+	// Set unread count to 1 to indicate unread status
+	_, err := store.db.Exec("UPDATE chats SET unread_count = 1 WHERE jid = ?", chatJID)
+	fmt.Printf("MarkChatAsUnread: Marking chat %s as unread\n", chatJID)
+	return err
+}
+
+// Mark specific message as read
+func (store *MessageStore) MarkMessageAsRead(messageID, chatJID string) error {
+	_, err := store.db.Exec("UPDATE messages SET is_read = TRUE WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID)
+	return err
+}
+
+// Check if messages are incoming (not from us)
+func (store *MessageStore) AreMessagesIncoming(messageIDs []string, chatJID string) (bool, error) {
+	// If no message IDs, return false
+	if len(messageIDs) == 0 {
+		return false, nil
+	}
+
+	// Prepare query to check if any of the messages are incoming (is_from_me = 0)
+	query := `
+		SELECT COUNT(*) 
+		FROM messages 
+		WHERE id IN (` + strings.Repeat("?,", len(messageIDs)-1) + `?) 
+		AND chat_jid = ?
+		AND is_from_me = 0`
+
+	// Prepare arguments for the query
+	args := make([]interface{}, len(messageIDs)+1)
+	for i, id := range messageIDs {
+		args[i] = id
+	}
+	args[len(messageIDs)] = chatJID
+
+	// Execute query
+	var count int
+	err := store.db.QueryRow(query, args...).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+
+	// If count > 0, at least one message is incoming
+	return count > 0, nil
+}
+
+// GetChatsResponse represents the response for the get chats API
+type GetChatsResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Chats   []Chat `json:"chats,omitempty"`
+}
+
+// MarkChatReadRequest represents the request body for marking a chat as read/unread
+type MarkChatReadRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Read    bool   `json:"read"` // true to mark as read, false to mark as unread
+}
+
+// MarkChatReadResponse represents the response for marking a chat as read/unread
+type MarkChatReadResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// Handle chat read status changes from other devices
+func handleMarkChatAsRead(messageStore *MessageStore, evt *events.MarkChatAsRead, logger waLog.Logger) {
+	chatJID := evt.JID.String()
+
+	// Check if we have an action and if the chat was marked as read
+	if evt.Action != nil && evt.Action.Read != nil {
+		if *evt.Action.Read {
+			// Chat was marked as read, update the database
+			err := messageStore.MarkChatAsRead(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to update read status for chat %s: %v", chatJID, err)
+			} else {
+				logger.Infof("Chat %s marked as read from another device at %s",
+					chatJID, evt.Timestamp.Format("2006-01-02 15:04:05"))
+			}
+		} else {
+			// Chat was marked as unread, update the database
+			err := messageStore.MarkChatAsUnread(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to update unread status for chat %s: %v", chatJID, err)
+			} else {
+				logger.Infof("Chat %s marked as unread from another device at %s",
+					chatJID, evt.Timestamp.Format("2006-01-02 15:04:05"))
+			}
+		}
+	}
+}
+
+// Handle receipt events (e.g., when someone reads a message we sent)
+func handleReceipt(messageStore *MessageStore, receipt *events.Receipt, logger waLog.Logger) {
+	chatJID := receipt.Chat.String()
+	// Print receipt details for debugging
+	fmt.Printf("Receipt details: chat=%s, sender=%s, isFromMe=%v, messageIDs=%v\n",
+		chatJID, receipt.Sender.User, receipt.IsFromMe, receipt.MessageIDs)
+
+	logger.Infof("Received receipt for messages not in database - can't update read status for specific messages")
+	// Although we don't have the specific messages, if this is a receipt we generated,
+	// we can still update the chat's unread count
+	if receipt.IsFromMe {
+		err := messageStore.MarkChatAsRead(chatJID)
+		if err != nil {
+			logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
+		} else {
+			fmt.Printf("Received receipt for our read action - marking chat %s as read\n", chatJID)
+		}
+	}
+
+	// If the receipt is from us (we generated it), it means we've read messages in this chat
+	if receipt.IsFromMe {
+		// Check if any of the messages are incoming (sent to us)
+		hasIncomingMessages, err := messageStore.AreMessagesIncoming(receipt.MessageIDs, chatJID)
+		if err != nil {
+			logger.Warnf("Failed to check if messages are incoming: %v", err)
+		} else if hasIncomingMessages {
+			// This is a receipt we generated for incoming messages
+			// Mark the chat as read (set unread count to 0)
+			err := messageStore.MarkChatAsRead(chatJID)
+			if err != nil {
+				logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
+			} else {
+				fmt.Printf("We've read incoming messages in chat %s - marking chat as read\n", chatJID)
+			}
+		} else {
+			fmt.Printf("We've read our own messages in chat %s - not changing unread count\n", chatJID)
+		}
+	} else {
+		// This is a receipt from another user indicating they've read our messages
+		fmt.Printf("User %s has read our messages in chat %s\n", receipt.Sender.User, chatJID)
+	}
+}
+
+// Group type detection helpers for WhatsApp Communities compatibility
+
+// isWhatsAppCommunity checks if a JID represents a WhatsApp Community
+func isWhatsAppCommunity(jid types.JID) bool {
+	// WhatsApp Communities use different server domains
+	return strings.HasSuffix(jid.Server, "g.us") && strings.Contains(jid.User, "-")
+}
+
+// isTraditionalGroup checks if a JID represents a traditional WhatsApp group
+func isTraditionalGroup(jid types.JID) bool {
+	return strings.HasSuffix(jid.Server, "g.us") && !strings.Contains(jid.User, "-")
+}
+
+// isPersonalChat checks if a JID represents a personal chat
+func isPersonalChat(jid types.JID) bool {
+	return strings.HasSuffix(jid.Server, "s.whatsapp.net")
+}
+
+// getGroupType returns the type of chat based on JID format
+func getGroupType(jid types.JID) string {
+	if isWhatsAppCommunity(jid) {
+		return "community"
+	} else if isTraditionalGroup(jid) {
+		return "group"
+	} else if isPersonalChat(jid) {
+		return "personal"
+	}
+	return "unknown"
+}
+
+// checkGroupCompatibility analyzes a JID and returns compatibility information
+func checkGroupCompatibility(jidString string) map[string]interface{} {
+	result := map[string]interface{}{
+		"jid":        jidString,
+		"is_valid":   false,
+		"group_type": "unknown",
+		"compatible": false,
+		"error":      nil,
+	}
+
+	// Parse JID
+	jid, err := types.ParseJID(jidString)
+	if err != nil {
+		result["error"] = fmt.Sprintf("Invalid JID format: %v", err)
+		return result
+	}
+
+	result["is_valid"] = true
+	groupType := getGroupType(jid)
+	result["group_type"] = groupType
+
+	// Determine compatibility
+	switch groupType {
+	case "personal":
+		result["compatible"] = true
+	case "group":
+		result["compatible"] = true
+	case "community":
+		// WhatsApp Communities have limited compatibility
+		result["compatible"] = false
+		result["error"] = "WhatsApp Communities are not fully supported due to API limitations. Consider using traditional groups instead."
+	default:
+		result["compatible"] = false
+		result["error"] = "Unknown chat type"
+	}
+
+	return result
 }

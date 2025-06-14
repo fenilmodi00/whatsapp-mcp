@@ -29,11 +29,30 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    group_type: Optional[str] = None
+    compatible: Optional[bool] = None
+    unread_count: Optional[int] = None
 
     @property
     def is_group(self) -> bool:
         """Determine if chat is a group based on JID pattern."""
         return self.jid.endswith("@g.us")
+    
+    def get_group_type(self) -> str:
+        """Determine the group type based on JID format."""
+        if self.jid.endswith("@s.whatsapp.net"):
+            return "personal"
+        elif self.jid.endswith("@g.us"):
+            if "-" in self.jid.split("@")[0]:
+                return "community"
+            else:
+                return "group"
+        return "unknown"
+    
+    def is_compatible(self) -> bool:
+        """Check if this chat type is compatible with messaging operations."""
+        group_type = self.get_group_type()
+        return group_type in ["personal", "group"]
 
 @dataclass
 class Contact:
@@ -329,22 +348,30 @@ def list_chats(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-        
         if include_last_message:
-            query_parts.append("""
+            query_parts = ["""
+                SELECT 
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    messages.content as last_message,
+                    messages.sender as last_sender,
+                    messages.is_from_me as last_is_from_me
+                FROM chats
                 LEFT JOIN messages ON chats.jid = messages.chat_jid 
                 AND chats.last_message_time = messages.timestamp
-            """)
+            """]
+        else:
+            query_parts = ["""
+                SELECT 
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats
+            """]
             
         where_clauses = []
         params = []
@@ -378,6 +405,11 @@ def list_chats(
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
+            
+            # Add group type and compatibility information
+            chat.group_type = chat.get_group_type()
+            chat.compatible = chat.is_compatible()
+            
             result.append(chat)
             
         return result
@@ -765,3 +797,67 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def get_unread_messages(limit: int = 10) -> List[dict]:
+    """Get an overview of recent chats with unread messages.
+    
+    Args:
+        limit: Maximum number of chats with unread messages to return (default 10)
+    
+    Returns:
+        A list of chat objects with unread message information
+    """
+    try:
+        # Make request to the WhatsApp bridge API to get chats with unread counts
+        url = f"{WHATSAPP_API_BASE_URL}/chats"
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success", False) and "chats" in result:
+                chats = result["chats"]
+                
+                # Filter chats with unread messages and limit the results
+                unread_chats = []
+                for chat in chats:
+                    if chat.get("UnreadCount", 0) > 0:
+                        # Get chat name from database if not provided
+                        chat_info = get_chat(chat["JID"], include_last_message=True)
+                        if chat_info:
+                            unread_chats.append({
+                                "jid": chat["JID"],
+                                "name": chat_info.get("name", "Unknown"),
+                                "unread_count": chat.get("UnreadCount", 0),
+                                "last_message_time": chat.get("LastMessageTime", ""),
+                                "last_message": chat_info.get("last_message", ""),
+                                "last_sender": chat_info.get("last_sender", ""),
+                                "is_group": chat["JID"].endswith("@g.us")
+                            })
+                        else:
+                            unread_chats.append({
+                                "jid": chat["JID"],
+                                "name": "Unknown",
+                                "unread_count": chat.get("UnreadCount", 0),
+                                "last_message_time": chat.get("LastMessageTime", ""),
+                                "last_message": None,
+                                "last_sender": None,
+                                "is_group": chat["JID"].endswith("@g.us")
+                            })
+                        
+                        if len(unread_chats) >= limit:
+                            break
+                
+                return unread_chats
+            else:
+                print(f"API error: {result.get('message', 'Unknown error')}")
+                return []
+        else:
+            print(f"HTTP error: {response.status_code} - {response.text}")
+            return []
+            
+    except requests.RequestException as e:
+        print(f"Request error: {str(e)}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        return []
